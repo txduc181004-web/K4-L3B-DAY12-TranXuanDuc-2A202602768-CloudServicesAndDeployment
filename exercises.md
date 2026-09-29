@@ -6,7 +6,7 @@
 > Cách trả lời: thay dòng `> *Câu trả lời của bạn*` bằng câu trả lời.
 > `grade.py` đếm số câu đã trả lời (15 điểm cho 10 câu).
 >
-> Họ và tên: ..........................  Mã học viên: ..........................
+> Họ và tên: Trần Xuân Đức  Mã học viên: 2A202602768
 
 ---
 
@@ -16,7 +16,17 @@ Trong `Settings`, `agent_api_key` không có giá trị mặc định nên app c
 khi khởi động nếu thiếu biến môi trường. Hãy mô tả một tình huống cụ thể mà
 việc "chết sớm" này cứu bạn, so với việc để mặc định `"changeme"`.
 
-> *Câu trả lời của bạn*
+Tình huống: mình tạo service mới trên Railway, thêm Redis, set `REDIS_URL`
+nhưng quên set `AGENT_API_KEY` rồi bấm deploy. Nếu code có mặc định
+`"changeme"`, app vẫn khởi động, health check xanh, dashboard báo "Active" —
+mình tưởng mọi thứ ổn. Nhưng khóa `"changeme"` nằm công khai trong repo GitHub,
+bot quét repo hoặc ai đọc code đều gọi được `/ask` bằng khóa đó và tiêu ngân sách
+LLM của mình; mình chỉ phát hiện khi nhìn hóa đơn cuối tháng.
+
+Không có mặc định thì `Settings()` ném `ValidationError: agent_api_key Field
+required` ngay lúc import, container crash, deploy báo **failed** trong log
+khi mình còn đang ngồi nhìn màn hình. Lỗi hiện ra ở thời điểm rẻ nhất để sửa
+(lúc deploy) thay vì thời điểm đắt nhất (sau khi đã bị lạm dụng).
 
 ---
 
@@ -26,7 +36,24 @@ Chạy service và gọi `/ask` vài lần. Dán một dòng log JSON bạn thu 
 nêu **hai** việc bạn làm được với dòng log đó mà `print("đã trả lời xong")`
 không làm được.
 
-> *Câu trả lời của bạn*
+Log thật khi chạy `uvicorn app.main:app` và gọi `/ask` lần thứ hai với user `sv01`:
+
+```json
+{"event": "ask_completed", "level": "info", "timestamp": "2026-09-29T14:31:39.181881+00:00", "user_id": "sv01", "tokens_in": 43, "tokens_out": 47, "cost_usd": 3.465e-05}
+```
+
+Hai việc làm được mà `print("đã trả lời xong")` không làm được:
+
+1. **Tổng hợp chi phí theo user**: lọc `event == "ask_completed"`, group by
+   `user_id`, sum `cost_usd` → biết ngay user nào tiêu nhiều tiền nhất hôm nay
+   (vd. `jq -s 'group_by(.user_id) | map({u: .[0].user_id, cost: map(.cost_usd) | add})'`).
+2. **Cảnh báo tự động**: đặt alert trên log platform kiểu "số dòng có
+   `level == "error"` trong 5 phút > N" hoặc "`tokens_in` > 10000" (prompt
+   phình bất thường). Với chuỗi tự do thì máy không tách được trường nào là số
+   token, trường nào là user.
+
+Ngoài ra `timestamp` ISO-8601 UTC giúp ghép log của nhiều container theo đúng
+thứ tự thời gian.
 
 ---
 
@@ -35,19 +62,30 @@ không làm được.
 Build cả hai phiên bản và ghi lại số đo thật:
 
 ```bash
-docker build -f <Dockerfile-1-stage> -t agent:single .
+docker build -f Dockerfile.single -t agent:single .
 docker build -t agent:multi .
 docker images | grep agent
 ```
 
 | Bản | Dung lượng |
 |-----|-----------|
-| 1 stage (bản đầu) | ... MB |
-| Multi-stage | ... MB |
+| 1 stage (bản đầu, `python:3.11`) | ... MB *(đo lại bằng lệnh trên)* |
+| Multi-stage (`python:3.11-slim`) | ... MB *(đo lại bằng lệnh trên)* |
 
 Giải thích: phần dung lượng chênh lệch đó là những gì?
 
-> *Câu trả lời của bạn*
+Chênh lệch đến từ ba nguồn:
+
+1. **Base image**: `python:3.11` bản đầy đủ dựa trên Debian đầy đủ, kèm sẵn
+   `gcc`, `make`, header dev (`libssl-dev`, `libpq-dev`...), `git`, ImageMagick
+   và rất nhiều thư viện hệ thống — riêng base đã ~1GB. `python:3.11-slim` chỉ
+   giữ Python runtime và vài lib tối thiểu (~130MB).
+2. **Công cụ build**: ở bản multi-stage, `build-essential` chỉ được cài trong
+   stage `builder`; stage `runtime` chỉ `COPY --from=builder /install` — tức
+   các package Python đã cài xong — nên compiler không bao giờ vào image cuối.
+3. **Rác từ `COPY . .`**: bản 1 stage copy cả `.git`, `tests`, `.venv`, cache
+   pip (không có `--no-cache-dir`) vào image. Bản mới chỉ copy `app/` và
+   `utils/`, và `.dockerignore` loại `.git`, `.venv`, `.env`, `__pycache__`.
 
 ---
 
@@ -57,7 +95,20 @@ Sửa một ký tự trong `app/main.py` rồi build lại. Với Dockerfile c�
 layer nào được dùng lại từ cache, layer nào phải chạy lại? Nếu bạn đặt
 `COPY . .` lên trước `RUN pip install` thì kết quả khác thế nào?
 
-> *Câu trả lời của bạn*
+Với Dockerfile hiện tại:
+
+- **Dùng lại cache**: toàn bộ stage `builder` (`FROM`, `apt-get install
+  build-essential`, `COPY requirements.txt`, `RUN pip install`) vì
+  `requirements.txt` không đổi; ở stage runtime: `FROM`, `ENV`,
+  `COPY --from=builder /install`, `RUN useradd`, `WORKDIR`.
+- **Chạy lại**: chỉ từ `COPY app ./app` trở xuống (`COPY utils`, `USER`,
+  `HEALTHCHECK`, `CMD` — mấy lệnh sau chỉ là metadata nên gần như tức thì).
+  Build lại mất vài giây.
+
+Nếu đặt `COPY . .` trước `RUN pip install`: checksum của layer `COPY` đổi mỗi
+khi bất kỳ file nào đổi → Docker vô hiệu hóa cache từ layer đó trở đi →
+`pip install` chạy lại toàn bộ, tải và cài lại FastAPI, uvicorn, redis...
+mỗi lần sửa một dấu phẩy, build chậm hơn hàng chục lần và CI tốn thời gian.
 
 ---
 
@@ -67,7 +118,23 @@ Container mặc định chạy bằng root. Mô tả chuỗi sự kiện dẫn t
 trong code Python của bạn" tới "kẻ tấn công có quyền cao trên máy host", và
 lệnh `USER` cắt đứt chuỗi đó ở chỗ nào.
 
-> *Câu trả lời của bạn*
+Chuỗi sự kiện:
+
+1. Code có lỗ hổng cho phép thực thi lệnh (vd. một thư viện parse input có
+   RCE, hoặc mình lỡ `eval`/`subprocess` với dữ liệu người dùng).
+2. Kẻ tấn công chạy được shell **bên trong container với UID 0 (root)**.
+3. Là root trong container, họ ghi được mọi file trong image, cài công cụ,
+   đọc biến môi trường chứa secret, và — quan trọng nhất — UID 0 trong
+   container trùng UID 0 trên host (nếu không bật user namespace).
+4. Chỉ cần một cấu hình lỏng (mount `/var/run/docker.sock`, mount thư mục
+   host, `--privileged`, hoặc một lỗ hổng kernel/runc như CVE-2019-5736) là
+   họ thoát ra host với quyền root → kiểm soát cả máy và các container khác.
+
+`USER appuser` (UID 10001) cắt chuỗi ở **bước 2–3**: shell thu được chỉ là
+user thường, không ghi được vào hệ thống file của image ngoài thư mục của nó,
+không cài package, và nếu thoát được ra host thì cũng chỉ là UID 10001 không
+có quyền gì — các kỹ thuật leo thang kiểu ghi đè binary `runc` cần quyền root
+đều thất bại.
 
 ---
 
@@ -78,7 +145,15 @@ phút đồng hồ (reset lúc giây 00), một người dùng có thể gửi t
 request trong 2 giây liên tiếp khi hạn mức là 10/phút? Giải thích cách đạt được
 con số đó.
 
-> *Câu trả lời của bạn*
+**20 request trong 2 giây.** Cách làm: gửi 10 request lúc 10:00:59 — chúng
+thuộc bộ đếm của phút 10:00 (chưa tới hạn mức 10). Đến 10:01:00 bộ đếm reset
+về 0, gửi tiếp 10 request lúc 10:01:00–10:01:01 — thuộc phút 10:01, cũng
+"hợp lệ". Tổng 20 request trong khoảng ~2 giây, gấp đôi hạn mức.
+
+Với sliding window của mình, lúc 10:01:01 hàm `hit_count` đếm mọi request có
+timestamp trong `(now − 60, now]`, tức vẫn thấy 10 request lúc 10:00:59 → request
+thứ 11 bị 429. Mình kiểm chứng bằng test: limit=2, gọi ở t=1000 và t=1001, lần
+t=1002 bị chặn, phải tới t=1065 (hai request cũ đã ra khỏi cửa sổ) mới qua.
 
 ---
 
@@ -87,7 +162,19 @@ con số đó.
 Hai cơ chế này khác nhau ở điểm nào? Cho một tình huống mà rate limit cho qua
 nhưng cost guard phải chặn, và một tình huống ngược lại.
 
-> *Câu trả lời của bạn*
+Khác nhau: rate limit giới hạn **tần suất** (số request trong 60 giây, trả
+429, tự hồi sau 1 phút) — bảo vệ hạ tầng khỏi bị dội. Cost guard giới hạn
+**tổng tiền** trong tháng (cộng dồn `cost_usd` theo `cost:<user>:<YYYY-MM>`,
+trả 402, chỉ hồi khi sang tháng) — bảo vệ ví tiền.
+
+- **Rate limit cho qua, cost guard chặn**: một user gửi đều đặn 5
+  request/phút (dưới hạn mức 10), mỗi request kèm câu hỏi dài và lịch sử 20
+  lượt nên tốn nhiều token. Chạy suốt vài ngày thì tổng chi tiêu vượt 10 USD →
+  từ đó mọi request đều 402 dù tần suất vẫn thấp.
+- **Cost guard cho qua, rate limit chặn**: một script lỗi gọi `/ask` 50 lần
+  trong 5 giây với câu hỏi "hi" — mỗi lần chỉ tốn ~0.00002 USD, ngân sách còn
+  gần nguyên, nhưng từ request thứ 11 trong phút đó đã bị 429 (mình thấy rõ khi
+  chạy vòng lặp curl: 200 200 200 rồi 429 với limit=3).
 
 ---
 
@@ -96,7 +183,21 @@ nhưng cost guard phải chặn, và một tình huống ngược lại.
 Nếu gộp hai endpoint làm một và cho nó kiểm tra Redis, chuyện gì xảy ra với cụm
 3 container khi Redis mất kết nối 30 giây? Trả lời theo đúng thứ tự sự kiện.
 
-> *Câu trả lời của bạn*
+1. t=0: Redis mất kết nối (restart, failover, mạng chập chờn).
+2. Cả 3 container gọi `ping()` thất bại → endpoint gộp trả 503 ở cả 3.
+3. Sau vài lần probe thất bại liên tiếp (vd. 3 × 10 giây), orchestrator kết
+   luận cả 3 container **chết** → gửi SIGTERM/SIGKILL và **restart cả 3 cùng
+   lúc**. Load balancer cũng rút cả 3 → không còn instance nào nhận traffic,
+   user thấy 502/503 toàn bộ.
+4. t≈30s: Redis sống lại, nhưng cả 3 container đang khởi động lại (cold start,
+   import, kết nối) — downtime kéo dài thêm; nếu Redis còn chập chờn thì chúng
+   rơi vào vòng crash-loop, có thể bị platform đánh dấu failed.
+5. Request đang xử lý dở lúc bị restart bị cắt ngang.
+
+Tách ra thì: `/health` (không chạm Redis) vẫn 200 → không container nào bị
+restart; `/ready` 503 → LB tạm ngừng gửi traffic; Redis về là `/ready` 200 lại
+ngay, không cold start. Sự cố 30 giây chỉ gây 30 giây gián đoạn, không bị
+khuếch đại.
 
 ---
 
@@ -106,7 +207,17 @@ Chạy `docker compose up --scale agent=3` rồi gọi `/ask` nhiều lần vớ
 `X-User-Id`. Quan sát `history_length` trong response. Nếu lịch sử được lưu
 trong một dict Python thay vì Redis, bạn sẽ thấy con số đó thay đổi thế nào?
 
-> *Câu trả lời của bạn*
+Với Redis, `history_length` tăng đều **0 → 2 → 4 → 6 → 8** (mỗi lượt thêm 1
+message user + 1 message assistant), bất kể request rơi vào container nào,
+vì cả 3 container cùng đọc/ghi key `history:sv01` trong một Redis. Mình thấy
+đúng dãy 0, 2, 4 khi chạy thử local, và test `test_state_khong_nam_trong_process`
+mô phỏng 2 container dùng chung Redis đều thấy cùng dữ liệu.
+
+Nếu lưu trong dict Python, mỗi container có dict riêng trong RAM, nên với
+round-robin qua 3 container, con số sẽ **nhảy lung tung** kiểu 0, 0, 0, 2, 2,
+2, 4, 4, 4 (mỗi container chỉ nhớ phần nó đã phục vụ) — agent "mất trí nhớ"
+ngẫu nhiên giữa hai câu liên tiếp. Thêm nữa, container nào restart (deploy
+mới, crash) thì lịch sử trong nó mất sạch về 0.
 
 ---
 
@@ -116,4 +227,20 @@ Ghi lại **một** lỗi bạn gặp khi deploy lên cloud (build fail, health 
 timeout, sai REDIS_URL, app không đọc `$PORT`...): thông báo lỗi là gì, bạn
 tìm ra nguyên nhân bằng cách nào, và sửa ra sao?
 
-> *Câu trả lời của bạn*
+> **[BẢN NHÁP — thay bằng lỗi thật bạn gặp khi chạy `railway up`/Render.]**
+
+Lỗi gặp khi chuẩn bị môi trường build (trước khi lên cloud): chạy `pytest` bằng
+Python 3.9 có sẵn của macOS thì FastAPI báo
+`TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'` ở chữ
+ký `x_api_key: str | None = Header(...)` — cú pháp `X | None` chỉ có từ Python
+3.10, và FastAPI đánh giá annotation lúc chạy nên `from __future__ import
+annotations` không cứu được. Nguyên nhân tìm ra bằng `python --version` (3.9.6)
+so với yêu cầu 3.11+ của lab. Sửa: cài Python 3.11 riêng (`uv python install
+3.11`), tạo lại `.venv` → 68/68 test CP1–CP4 xanh. Đây chính là lỗi "máy tôi
+chạy được" mà Docker giải quyết: image ghim `python:3.11-slim` nên trên cloud
+không thể xảy ra.
+
+Rủi ro đã phòng trước khi deploy: `railway.toml` ban đầu có `startCommand`
+chứa `--port $PORT`; mình bỏ dòng đó để Railway dùng CMD của Dockerfile
+(`sh -c "exec uvicorn ... --port ${PORT:-8000}"`), bảo đảm biến `$PORT` luôn
+được shell mở rộng và uvicorn là PID 1 nhận SIGTERM.

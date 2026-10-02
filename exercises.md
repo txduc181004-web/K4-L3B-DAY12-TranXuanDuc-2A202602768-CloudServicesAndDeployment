@@ -69,8 +69,11 @@ docker images | grep agent
 
 | Bản | Dung lượng |
 |-----|-----------|
-| 1 stage (bản đầu, `python:3.11`) | ... MB *(đo lại bằng lệnh trên)* |
-| Multi-stage (`python:3.11-slim`) | ... MB *(đo lại bằng lệnh trên)* |
+| 1 stage (bản đầu, `python:3.11`) | 1.73 GB (nén khi push: 436 MB) |
+| Multi-stage (`python:3.11-slim`) | 298 MB (nén khi push: 64.3 MB) |
+
+Đo bằng `docker images` (Docker 29.8.1, máy Mac arm64): bản multi-stage nhỏ
+hơn khoảng 5,8 lần.
 
 Giải thích: phần dung lượng chênh lệch đó là những gì?
 
@@ -227,20 +230,31 @@ Ghi lại **một** lỗi bạn gặp khi deploy lên cloud (build fail, health 
 timeout, sai REDIS_URL, app không đọc `$PORT`...): thông báo lỗi là gì, bạn
 tìm ra nguyên nhân bằng cách nào, và sửa ra sao?
 
-> **[BẢN NHÁP — thay bằng lỗi thật bạn gặp khi chạy `railway up`/Render.]**
+**Lỗi:** sau khi nối repo GitHub vào Railway, service build xong và báo
+Online, nhưng biến `AGENT_API_KEY` không vào được app. Mình đã tạo biến này ở
+**Project Settings → Shared Variables** chứ không phải trong service. Trên
+dashboard, cạnh tên biến có biểu tượng `!` màu vàng, nút **SHARE** chưa bấm, và
+dòng environment `production` ghi **0 variables**. Lúc đó project cũng chưa có
+Redis, nên `REDIS_URL` không có giá trị để `/ready` kết nối.
 
-Lỗi gặp khi chuẩn bị môi trường build (trước khi lên cloud): chạy `pytest` bằng
-Python 3.9 có sẵn của macOS thì FastAPI báo
-`TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'` ở chữ
-ký `x_api_key: str | None = Header(...)` — cú pháp `X | None` chỉ có từ Python
-3.10, và FastAPI đánh giá annotation lúc chạy nên `from __future__ import
-annotations` không cứu được. Nguyên nhân tìm ra bằng `python --version` (3.9.6)
-so với yêu cầu 3.11+ của lab. Sửa: cài Python 3.11 riêng (`uv python install
-3.11`), tạo lại `.venv` → 68/68 test CP1–CP4 xanh. Đây chính là lỗi "máy tôi
-chạy được" mà Docker giải quyết: image ghim `python:3.11-slim` nên trên cloud
-không thể xảy ra.
+**Tìm nguyên nhân:** Shared Variables chỉ là biến dùng chung ở cấp project.
+Railway chỉ đưa biến vào container khi biến được đặt trong service hoặc được
+SHARE cho service. Biểu tượng `!` và con số "0 variables" cho thấy chưa service
+nào nhận biến.
 
-Rủi ro đã phòng trước khi deploy: `railway.toml` ban đầu có `startCommand`
-chứa `--port $PORT`; mình bỏ dòng đó để Railway dùng CMD của Dockerfile
-(`sh -c "exec uvicorn ... --port ${PORT:-8000}"`), bảo đảm biến `$PORT` luôn
-được shell mở rộng và uvicorn là PID 1 nhận SIGTERM.
+**Cách sửa:**
+1. `+ Add → Database → Redis` để tạo Redis (kèm `redis-volume`).
+2. Vào tab **Variables** của service agent, thêm `AGENT_API_KEY`,
+   `REDIS_URL=${{Redis.REDIS_URL}}`, `RATE_LIMIT_PER_MINUTE`,
+   `MONTHLY_BUDGET_USD`, `LOG_LEVEL`. Railway hiện "Apply 5 changes"; bấm
+   **Deploy** thì biến mới có hiệu lực. Trên sơ đồ xuất hiện mũi tên agent →
+   Redis, tức tham chiếu đã đúng.
+3. **Settings → Networking → Generate Domain** vì service đang ở trạng thái
+   "Unexposed service", chưa có URL công khai.
+
+**Kết quả:** `/health` trả 200, `/ready` trả `{"status":"ready","redis":true}`,
+`/ask` không có key trả 401, có key trả 200, gọi 15 lần liên tiếp thì bị 429.
+
+Thêm một điểm dễ nhầm: mở URL gốc trên trình duyệt thấy
+`{"detail":"Not Found"}`. Đó không phải lỗi deploy. App chỉ định nghĩa
+`/health`, `/ready`, `/ask`, nên FastAPI trả 404 cho `/`.
